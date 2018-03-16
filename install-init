@@ -1,0 +1,128 @@
+#!/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+ROOT_MOUNT="/rootfs"
+MOUNT="/bin/mount"
+UMOUNT="/bin/umount"
+ROOT_DELAY="0"
+NO_ASK="--yes"
+
+# Copied from initramfs-framework. The core of this script probably should be
+# turned into initramfs-framework modules to reduce duplication.
+udev_daemon() {
+	OPTIONS="/sbin/udev/udevd /sbin/udevd /lib/udev/udevd /lib/systemd/systemd-udevd"
+
+	for o in $OPTIONS; do
+		if [ -x "$o" ]; then
+			echo $o
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+_UDEV_DAEMON=`udev_daemon`
+
+early_setup() {
+    mkdir -p /proc
+    mkdir -p /sys
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    mount -t devtmpfs none /dev
+
+    mkdir -p /run
+    mkdir -p /var/run
+
+    $_UDEV_DAEMON --daemon
+    udevadm trigger --action=add
+
+    if [ -x /sbin/mdadm ]; then
+	/sbin/mdadm -v --assemble --scan --auto=md
+    fi
+}
+
+read_args() {
+    [ -z "$CMDLINE" ] && CMDLINE=`cat /proc/cmdline`
+    for arg in $CMDLINE; do
+        optarg=`expr "x$arg" : 'x[^=]*=\(.*\)'`
+        case $arg in
+	    sfrtgt=*)
+		SFR_TARGET=$optarg ;;
+	    sfrmnt=*)
+		SFR_MNT_LABEL=$optarg ;;
+            root=*)
+                ROOT_DEVICE=$optarg ;;
+            rootdelay=*)
+                ROOT_DELAY=$optarg ;;
+            debugtty=*)
+                DEBUGTTY=$optarg ;;
+            ask)
+                NO_ASK="" ;;
+            init=*)
+                INIT=$optarg ;;
+        esac
+    done
+}
+
+fatal() {
+    echo $1 >$CONSOLE
+    echo >$CONSOLE
+    exec sh
+}
+
+early_setup
+
+read_args
+
+[ -z "$CONSOLE" ] && CONSOLE="/dev/console"
+[ -z "$INIT" ] && INIT="/sbin/init"
+
+udevadm settle --timeout=3
+mkdir -p /opt
+for e in 1 2 3 4 5 6 7 8 9 10 ; do 
+    mount -o rw $SFR_MNT_LABEL /opt
+    if [ $? = 0 ] ; then
+	break
+    else
+	echo "Retry mount to: $SFR_MNT_LABEL"
+	sleep 1
+    fi
+done
+ifconfig lo up
+cd /opt/installer
+
+
+# time ./installers/cubeit-installer $NO_ASK --encrypt --encrypt-data -b --artifacts `pwd`/images  images/cube-essential-* $SFR_TARGET
+
+
+### Pre Install customizations
+parted $SFR_TARGET rm 2
+parted $SFR_TARGET rm 3
+parted $SFR_TARGET rm 4
+### End Pre Install customizations
+
+if [ x$DEBUGTTY != x ] ; then
+	echo time ./installers/cubeit-installer $NO_ASK -b --artifacts `pwd`/images  images/cube-essential-* $SFR_TARGET
+	c=$DEBUGTTY
+	exec setsid sh -c "exec /bin/bash </dev/$c >/dev/$c 2>&1"
+fi
+
+time ./installers/cubeit-installer $NO_ASK -b --artifacts `pwd`/images  images/cube-essential-* $SFR_TARGET
+
+### Post Install customizations
+sed -i 's/rootwait/rootwait ima_appraise=off console=ttyS1,115200/' /opt/EFI/BOOT/grub.cfg
+mkdir /tmp/a
+mount ${SFR_TARGET}3 /tmp/a
+mv /tmp/a/etc/systemd/system/getty.target.wants/screen-getty@ttyS0.service /tmp/a/etc/systemd/system/getty.target.wants/screen-getty@ttyS1.service
+ln -s /dev/null /tmp/a/etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service
+umount /tmp/a
+### End Post Install customizations
+
+### Reset system
+cd /
+umount /opt
+echo 3> /proc/sys/vm/drop_caches ; \
+sync ; \
+echo b > /proc/sysrq-trigger
+exit 0
