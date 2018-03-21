@@ -5,5 +5,5 @@ all:
 	if [ ! -e pflash ] ; then cp bios.bin pflash ; fi
 
 clean:
-	rm -rf efi-test.img efi_vol up-initrd.orig pflash grub-sfr.cfg.p7b initrd-extras pflash config_2G_efi/grub-sfr.cfg.p7b config_2G_efi/grub-final.cfg.p7b in config_xd10_efi/grub-sfr.cfg.p7b config_xd10_efi/grub-final.cfg.p7b
+	rm -rf efi-test.img efi_vol up-initrd.orig pflash grub-sfr.cfg.p7b initrd-extras pflash config_2G_efi/grub-sfr.cfg.p7b config_2G_efi/grub-final.cfg.p7b in config_xd10_efi/grub-sfr.cfg.p7b config_xd10_efi/grub-final.cfg.p7b upgrade.tar.bz2
 

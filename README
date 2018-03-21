@@ -1,0 +1,82 @@
+
+####################################################
+# Notes for use of testing the EFI self install key
+####################################################
+
+cd sfr
+make SOURCE_IMAGE=/INSTALL_IMAGE \
+   SELSIGN_TOOLS=/PATH_TO_SELSIGN/usr/bin \
+   PRIV_KEY=/PATH_TO_PRIV_KEY/vendor_cert.key \
+   PUB_KEY=/PATH_TO_PUB_KEY/vendor_cert.crt
+
+kvm -drive file=efi-test.img,if=virtio,format=raw \
+    -drive file=pflash,format=raw,if=pflash,id=flash \
+    -nographic -vnc :5  -m 2048  \
+    -netdev type=user,id=h1,hostfwd=tcp::6440-10.0.2.15:22,hostfwd=tcp::6441-10.0.2.15:2222 \
+    -device e1000,netdev=h1,mac=00:55:55:01:01:01,romfile= \
+    -bios pflash -serial telnet::6444,server,nowait -serial mon:stdio
+
+
+## Testing with an on target system ##
+
+# Build deploy image
+(cd efi_vol ; tar -cjf ../upgrade.tar.bz2 *)
+
+# Run on target device, login on cube-essential
+cd /boot
+# Pulsar 8 update command
+/var/lib/lxc/cube-gw/rootfs/usr_temp/bin/curl http://SOME_SERVER/upgrade.tar.ba2 | tar -xjvf -
+#Pulsar LTS update command
+/opt/container/cube-gw/rootfs/usr/bin/curl http://SOME_SERVER/upgrade.tar.ba2 | tar -xjvf -
+
+
+####################################################
+# Notes for use for upgrade with existing disk
+# without a large EFI partition
+####################################################
+
+make CONFIG=config_xd10_efi \
+   SOURCE_IMAGE=/INSTALL_IMAGE \
+   SELSIGN_TOOLS=/PATH_TO_SELSIGN/usr/bin \
+   PRIV_KEY=/PATH_TO_PRIV_KEY/vendor_cert.key \
+   PUB_KEY=/PATH_TO_PUB_KEY/vendor_cert.crt
+
+(rm -f upgrade.tar ; cd efi_vol ; tar -cvf ../upgrade.tar *)
+
+# Test with kvm if you have a disk image
+# Disk is an image of the disk you want to updgrade
+kvm -drive file=disk.qcow2,if=virtio \
+    -drive file=pflash,format=raw,if=pflash,id=flash -nographic -vnc :7  -m 2048  \
+    -netdev type=user,id=h1,hostfwd=tcp::7440-10.0.2.15:22,hostfwd=tcp::7441-10.0.2.15:2222 \
+    -device e1000,netdev=h1,mac=00:55:55:01:01:01,romfile= \
+    -bios pflash -serial telnet::7444,server,nowait \
+    -serial telnet::7445,server,nowait -serial mon:stdio 
+
+
+## Testing with an on target system ##
+
+## Build deploy image
+(cd efi_vol ; tar -cjf ../upgrade.tar.bz2 *)
+
+## Special instructions to run on target system
+
+DEV=/dev/vda
+### NOTE This destroys the data on the partition, if
+### you need to save it, you need to call resize2fs
+parted ---pretend-input-tty ${DEV} resizepart 9 123GB Yes
+parted --script ${DEV} mkpart logical fat32 127GB 100%
+mkfs.vfat -F32 -I -n OVERCSFR ${DEV}10
+parted --script ${DEV} set 10 boot on
+mkdir /tmp/a
+mkdir /tmp/b
+mount ${DEV}1 /tmp/a
+mount ${DEV}10 /tmp/b
+cp -a /tmp/a/* /tmp/b
+# Pulsar 8 command
+/var/lib/lxc/cube-gw/rootfs/usr_temp/bin/curl http://SOME_SERVER/upgrade.tar.ba2 | tar -C /tmp/b -xjvf -
+umount /tmp/a /tmp/b
+umount /boot
+parted --script ${DEV} rm 1
+reboot
+
+
