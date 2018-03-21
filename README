@@ -60,7 +60,7 @@ kvm -drive file=disk.qcow2,if=virtio \
 
 ## Special instructions to run on target system
 
-DEV=/dev/vda
+DEV=/dev/sda
 ### NOTE This destroys the data on the partition, if
 ### you need to save it, you need to call resize2fs
 parted ---pretend-input-tty ${DEV} resizepart 9 123GB Yes
