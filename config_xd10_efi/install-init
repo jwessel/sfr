@@ -79,7 +79,60 @@ read_args
 [ -z "$INIT" ] && INIT="/sbin/init"
 
 udevadm settle --timeout=3
+
+### Pre Install customizations
+
+# NOTE if SFR_TARGET set to xda try first for vda then sda
+if [ "$SFR_TARGET" = /dev/xda ] ; then
+    if [ -e /dev/vda ] ; then
+	SFR_TARGET=/dev/vda
+    else
+	SFR_TARGET=/dev/sda
+    fi
+fi
+
 mkdir -p /opt
+# When the first partition is not assigned, 
+# Reconfigure disk by recreating EFI volume prior to install phase
+good=0
+parted --script $SFR_TARGET print  |awk '{print $1}' |grep ^1\$
+if [ $? != 0 ] ; then
+    for e in 1 2 3 4 5 6 7 8 9 10 ; do 
+	mount -o ro LABEL=OVERCSFR /opt
+	if [ $? = 0 ] ; then
+	    good=1
+	    break
+	else
+	    echo "Retry mount for sfr_target"
+	    sleep 1
+	fi
+    done
+    if [ $good = 1 ] ; then
+	parted --script $SFR_TARGET rm 2
+	parted --script $SFR_TARGET rm 3
+	parted --script $SFR_TARGET mkpart primary fat32 2048s 2G
+	parted --script /dev/vda set 1 boot on
+	partprobe ${SFR_TARGET}
+	mkfs.vfat -F32 -I -n OVERCBOOT ${SFR_TARGET}1
+	mkdir -p /tmp/a
+	mount ${SFR_TARGET}1 /tmp/a
+	cp -a /opt/* /tmp/a
+	umount /tmp/a
+	umount /opt
+    fi
+fi
+
+# If we have a valid EFI partition proceed to remove everything else
+parted --script $SFR_TARGET print  |awk '{print $1}' |grep ^1\$
+if [ $? = 0 -a $good = 1 ] ; then
+    for e in `parted $SFR_TARGET print |grep logical |sort -r` \
+	`parted $SFR_TARGET print |grep extended |sort -r` ; do
+	parted --script $SFR_TARGET rm $e
+    done
+fi
+partprobe $SFR_TARGET
+
+###
 for e in 1 2 3 4 5 6 7 8 9 10 ; do 
     mount -o rw $SFR_MNT_LABEL /opt
     if [ $? = 0 ] ; then
@@ -96,10 +149,6 @@ cd /opt/installer
 # time ./installers/cubeit-installer $NO_ASK --encrypt --encrypt-data -b --artifacts `pwd`/images  images/cube-essential-* $SFR_TARGET
 
 
-### Pre Install customizations
-parted $SFR_TARGET rm 2
-parted $SFR_TARGET rm 3
-parted $SFR_TARGET rm 4
 ### End Pre Install customizations
 
 if [ x$DEBUGTTY != x ] ; then
@@ -111,8 +160,17 @@ fi
 time ./installers/cubeit-installer $NO_ASK -b --artifacts `pwd`/images  images/cube-essential-* $SFR_TARGET
 
 ### Post Install customizations
-sed -i 's/rootwait/rootwait ima_appraise=off console=ttyS1,115200/' /opt/EFI/BOOT/grub.cfg
-mkdir /tmp/a
+# Copy in a different signed grub config
+mkdir -p /tmp/a
+mount ${SFR_TARGET}1 /tmp/a
+if [ -f /opt/installer/grub-final.cfg ] ; then
+    cp /opt/installer/grub-final.cfg /tmp/a/EFI/BOOT/grub.cfg
+fi
+if [ -f /opt/installer/grub-final.cfg.p7b ] ; then
+    cp /opt/installer/grub-final.cfg.p7b /tmp/a/EFI/BOOT/grub.cfg.p7b
+fi
+umount /tmp/a
+# Fix up serial getty definition in cube-essential
 mount ${SFR_TARGET}3 /tmp/a
 mv /tmp/a/etc/systemd/system/getty.target.wants/screen-getty@ttyS0.service /tmp/a/etc/systemd/system/getty.target.wants/screen-getty@ttyS1.service
 ln -s /dev/null /tmp/a/etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service

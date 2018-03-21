@@ -9,6 +9,10 @@ SELSIGN_TOOLS="$2"
 PRIV_KEY="$3"
 PUB_KEY="$4"
 
+if [ -z "${config}" ] ; then
+    config=config_2G_efi
+fi
+
 if [ -z "${SOURCE_IMAGE}" -o ! -e "${SOURCE_IMAGE}" ] ; then
     echo ERROR: You must specify a valid SOURCE_IMAGE
     exit 1
@@ -31,11 +35,10 @@ if [ ${do_sign} = 1 ] ; then
     fi
 fi
 
-step1=1
-step2=1
-step3=1
-step4=1
-set -x
+step1=${step1=1}
+step2=${step2=1}
+step3=${step3=1}
+step4=${step4=1}
 
 #### Step 1 - Transition install media into a OTA style update
 if [ $step1 = 1 ] ; then
@@ -65,64 +68,89 @@ fi
 if [ $step2 = 1 ] ; then
     (
 	mv efi_vol/up-initrd up-initrd.orig
+	rm -rf in 
 	mkdir in
 	( cd in ; zcat ../up-initrd.orig | cpio -id)
-	cp install-init in
+	cp ${config}/install-init in
 	chmod 755 in/install-init
 	( cd initrd-extras ; tar -cf - * | tar -C ../in -xvf - )
 	( cd in ; find . | cpio -o -H newc | gzip -9 > ../efi_vol/up-initrd )
-	rm -rf in 
 
-	if [ $do_sign ] ; then
-	    # Sign grub
-	    LD_LIBRARY_PATH=${SELSIGN_TOOLS}/../lib ${SELSIGN_TOOLS}/selsign --key ${PRIV_KEY} --cert ${PUB_KEY} grub-sfr.cfg
+	if [ $do_sign = 1 ] ; then
+	    # Sign grub cfg
+	    LD_LIBRARY_PATH=${SELSIGN_TOOLS}/../lib ${SELSIGN_TOOLS}/selsign --key ${PRIV_KEY} --cert ${PUB_KEY} ${config}/grub-sfr.cfg
+
+	    if [ -e ${config}/grub-final.cfg ] ; then
+		# Sign finall installed grub cfg if exists
+		LD_LIBRARY_PATH=${SELSIGN_TOOLS}/../lib ${SELSIGN_TOOLS}/selsign --key ${PRIV_KEY} --cert ${PUB_KEY} ${config}/grub-final.cfg
+	    fi
 
 	    # Sign initrd
 	    LD_LIBRARY_PATH=${SELSIGN_TOOLS}/../lib ${SELSIGN_TOOLS}/selsign --key ${PRIV_KEY} --cert ${PUB_KEY} efi_vol/up-initrd
 	fi
 
 	# Copy grub files
-	cp grub-sfr.cfg efi_vol/EFI/BOOT/grub.cfg
-	if [ -e grub-sfr.cfg.p7b ] ; then
-	    cp grub-sfr.cfg.p7b efi_vol/EFI/BOOT/grub.cfg.p7b
+	cp ${config}/grub-sfr.cfg efi_vol/EFI/BOOT/grub.cfg
+	if [ -e ${config}/grub-sfr.cfg.p7b ] ; then
+	    cp ${config}/grub-sfr.cfg.p7b efi_vol/EFI/BOOT/grub.cfg.p7b
+	fi
+	if [ -e ${config}/grub-final.cfg ] ; then
+	    cp ${config}/grub-final.cfg efi_vol/installer/grub-final.cfg
+	    if [ -e ${config}/grub-final.cfg.p7b ] ; then
+		cp ${config}/grub-sfr.cfg.p7b efi_vol/installer/grub-final.cfg.p7b
+	    fi
 	fi
     )
 fi
 
 #### Step 3 - Customize installer to repartition or not repartition
 
-(cd mods; tar -cf - * | tar -C ../efi_vol -xf -)
+if [ $step3 = 1 ] ; then
+    (
+	instdir=$PWD
+	if [ -d ${config}/mods ] ; then
+	    cd ${config}/mods
+	    for e in `find . -type f -o -type l`; do
+		if [ -e $instdir/efi_vol/$e ] ; then
+		    mv $instdir/efi_vol/$e $instdir/efi_vol/$e.orig
+		fi
+		tar -cf - $e | tar -C $instdir/efi_vol -xf -
+	    done
+	fi
+    )
+fi
 
 #### Step 4 - trial disk
 
-(
-size=16G
-grub_cfg="grub-efi-recovery.cfg"
-file=efi-test.img
-rm -f $file
-qemu-img create -f raw $file $size
-chown $(stat -c "%u" $(dirname $file)) $file
-#parted -s $file mklabel gpt
-#parted -s $file mkpart ESP fat32 1MiB 2G
-#parted -s $file set 1 boot on
-parted -s $file mklabel msdos
-parted -s $file mkpart primary fat32 1MiB 2G
-parted -s $file set 1 boot on
-dev=`losetup -f --show $file`
-partprobe $dev
-which partx > /dev/null && partx -d $dev
-which partx > /dev/null && partx -v -a $dev
-mkfs.vfat -I -n OVERCBOOT ${dev}p1
-TMPMNT=`mktemp -d`
-mkdir -p $TMPMNT/mnt
-mount ${dev}p1 $TMPMNT/mnt
+if [ $step4 = 1 ] ; then
+    (
+	size=16G
+	file=efi-test.img
+	rm -f $file
+	qemu-img create -f raw $file $size
+	chown $(stat -c "%u" $(dirname $file)) $file
+	#parted -s $file mklabel gpt
+	#parted -s $file mkpart ESP fat32 1MiB 2G
+	#parted -s $file set 1 boot on
+	parted -s $file mklabel msdos
+	parted -s $file mkpart primary fat32 1MiB 2G
+	parted -s $file set 1 boot on
+	dev=`losetup -f --show $file`
+	partprobe $dev
+	which partx > /dev/null && partx -d $dev
+	which partx > /dev/null && partx -v -a $dev
+	mkfs.vfat -I -n OVERCBOOT ${dev}p1
+	TMPMNT=`mktemp -d`
+	mkdir -p $TMPMNT/mnt
+	mount ${dev}p1 $TMPMNT/mnt
 
-# Copy files
-mkdir -p ${TMPMNT}/mnt/EFI/BOOT
-rsync -a -v efi_vol/ ${TMPMNT}/mnt/
+	# Copy files
+	mkdir -p ${TMPMNT}/mnt/EFI/BOOT
+	rsync -a -v efi_vol/ ${TMPMNT}/mnt/ 2> /dev/null
 
-# Cleanup
-umount ${TMPMNT}/mnt
-rm -rf ${TMPMNT}
-losetup -d $dev
-)
+	# Cleanup
+	umount ${TMPMNT}/mnt
+	rm -rf ${TMPMNT}
+	losetup -d $dev
+    )
+fi
