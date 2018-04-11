@@ -58,25 +58,27 @@ kvm -drive file=disk.qcow2,if=virtio \
 ## Build deploy image
 (cd efi_vol ; tar -cjf ../upgrade.tar.bz2 *)
 
-## Special instructions to run on target system
+## Special instructions to run on target system from cube-essential
 
 DEV=/dev/sda
 ### NOTE This destroys the data on the partition, if
-### you need to save it, you need to call resize2fs
-parted ---pretend-input-tty ${DEV} resizepart 9 123GB Yes
-parted --script ${DEV} mkpart logical fat32 127GB 100%
+### you need to save it, you need to call resize2fs.
+### The idea is to use the last 2GB of the disk
+parted ---pretend-input-tty ${DEV} resizepart 9 455GB Yes
+parted --script ${DEV} mkpart logical fat32 455GB 457GB
+sync
+partprobe ${DEV}
 mkfs.vfat -F32 -I -n OVERCSFR ${DEV}10
-parted --script ${DEV} set 10 boot on
+sync
 mkdir /tmp/a
 mkdir /tmp/b
 mount ${DEV}1 /tmp/a
 mount ${DEV}10 /tmp/b
 cp -a /tmp/a/* /tmp/b
 # Pulsar 8 command
-/var/lib/lxc/cube-gw/rootfs/usr_temp/bin/curl http://SOME_SERVER/upgrade.tar.ba2 | tar -C /tmp/b -xjvf -
+/var/lib/lxc/cube-gw/rootfs/usr_temp/bin/curl http://SOME_SERVER/upgrade.tar.bz2 | tar -C /tmp/b -xjvf -
+cp /tmp/b/up* /tmp/a
+cp -a /tmp/b/EFI/BOOT/* /tmp/a/EFI/BOOT
 umount /tmp/a /tmp/b
 umount /boot
-parted --script ${DEV} rm 1
 reboot
-
-

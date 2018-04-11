@@ -81,7 +81,9 @@ read_args
 udevadm settle --timeout=3
 
 ### Pre Install customizations
-
+if [ x$DEBUGTTY != x ] ; then
+    set -x
+fi
 # NOTE if SFR_TARGET set to xda try first for vda then sda
 if [ "$SFR_TARGET" = /dev/xda ] ; then
     if [ -e /dev/vda ] ; then
@@ -92,11 +94,11 @@ if [ "$SFR_TARGET" = /dev/xda ] ; then
 fi
 
 mkdir -p /opt
-# When the first partition is not assigned, 
+# When there is a volume 10 available, 
 # Reconfigure disk by recreating EFI volume prior to install phase
 good=0
-parted --script $SFR_TARGET print  |awk '{print $1}' |grep ^1\$
-if [ $? != 0 ] ; then
+parted --script $SFR_TARGET print  |awk '{print $1}' |grep -q ^10\$
+if [ $? = 0 ] ; then
     for e in 1 2 3 4 5 6 7 8 9 10 ; do 
 	mount -o ro LABEL=OVERCSFR /opt
 	if [ $? = 0 ] ; then
@@ -108,12 +110,15 @@ if [ $? != 0 ] ; then
 	fi
     done
     if [ $good = 1 ] ; then
+	parted --script $SFR_TARGET rm 1
 	parted --script $SFR_TARGET rm 2
 	parted --script $SFR_TARGET rm 3
 	parted --script $SFR_TARGET mkpart primary fat32 2048s 2G
-	parted --script /dev/vda set 1 boot on
+	parted --script $SFR_TARGET set 1 boot on
+	sync
 	partprobe ${SFR_TARGET}
 	mkfs.vfat -F32 -I -n OVERCBOOT ${SFR_TARGET}1
+	sync
 	mkdir -p /tmp/a
 	mount ${SFR_TARGET}1 /tmp/a
 	cp -a /opt/* /tmp/a
@@ -152,6 +157,7 @@ cd /opt/installer
 ### End Pre Install customizations
 
 if [ x$DEBUGTTY != x ] ; then
+	set +x
 	echo time ./installers/cubeit-installer $NO_ASK -b --artifacts `pwd`/images  images/cube-essential-* $SFR_TARGET
 	c=$DEBUGTTY
 	exec setsid sh -c "exec /bin/bash </dev/$c >/dev/$c 2>&1"
@@ -172,8 +178,7 @@ fi
 umount /tmp/a
 # Fix up serial getty definition in cube-essential
 mount ${SFR_TARGET}3 /tmp/a
-mv /tmp/a/etc/systemd/system/getty.target.wants/screen-getty@ttyS0.service /tmp/a/etc/systemd/system/getty.target.wants/screen-getty@ttyS1.service
-ln -s /dev/null /tmp/a/etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service
+ln -s /dev/null /tmp/a/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
 umount /tmp/a
 ### End Post Install customizations
 
