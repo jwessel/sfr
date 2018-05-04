@@ -1,0 +1,1234 @@
+#!/bin/bash
+
+# ensure we get expected and consistent modes for dir creation, etc..
+umask 0022
+
+if [ "$CUBE_DEBUG_SET_X_IF_SET" = 1 ] ; then
+    set -x
+fi
+
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License version 2 as
+#  published by the Free Software Foundation.
+
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#  See the GNU General Public License for more details.
+
+CURRENTDIR=$(pwd)
+BASEDIR=$(readlink -f $(dirname $BASH_SOURCE))
+IMAGESDIR="${BASEDIR}/../images"
+CONTAINERSDIR="${BASEDIR}/../images/containers"
+PACKAGESDIR="${BASEDIR}/../packages"
+SBINDIR="${BASEDIR}/../sbin"
+LIBDIR="${BASEDIR}/../lib"
+export SBINDIR
+if [ -z "${CONFIG_DIRS}" ] ; then
+    CONFIG_DIRS="${BASEDIR}/../config $HOME/.overc/"
+fi
+export CONFIG_DIRS
+
+# Debug Levels - fixed values
+DEBUG_SILENT=0
+DEBUG_CRIT=1
+DEBUG_WARN=2
+DEBUG_INFO=4
+DEBUG_VERBOSE=7
+
+FACTORY_SNAPSHOT=".factory"
+
+# Set your default debug level
+: ${DEBUG_DEFAULT:=${DEBUG_INFO}}
+: ${FUNCTIONS_FILE="$SBINDIR/functions.sh"}
+
+# Dynamic debug level
+DEBUG_LEVEL=${DEBUG_DEFAULT}
+: ${TRACE:=0}
+
+#get the target's architecture, x86 or not x86?
+export X86_ARCH=true
+if [ $(uname -p 2>/dev/null | grep -ic x86) != '1' ]; then
+    # if the processor type isn't x86, set x86 to false
+    export X86_ARCH=false
+
+    # but! some emulated platforms (i.e. qemu) report unknown, so we 
+    # double check, and set ourselves back to x86 if unkown is reported
+    if [ $(uname -p 2>/dev/null | grep -ic unknown) = '1' ]; then
+	export X86_ARCH=true
+    fi
+fi
+
+## Load function file(s)
+if ! [ -e $FUNCTIONS_FILE ]; then
+    debugmsg ${DEBUG_CRIT} "[ERROR]: Could not find function definitions (${FUNCTIONS_FILE})"
+    exit 1
+fi
+source $FUNCTIONS_FILE
+
+usage()
+{
+cat << EOF
+
+  cubeit-installer <base image> <device>
+
+    -b: use btrfs
+    -i or --interactive: use the interactive configuration interface
+    --finaldev: boot from this block dev. Default is vda
+    --ttyconsoledev: set dev used for tty console
+    --ttyconsolecn: set container name for providing agetty
+    --encrypt: encrypt the rootfs
+    --yes: answer 'yes' to all questions for clearing TPM and wiping
+           the rootfs device for the disk encryption
+EOF
+}
+
+if [ -z "$1" ]; then
+    usage
+    exit
+fi
+
+btrfs=0
+ttyconsolecn=""
+ttyconsoledev="ttyS0"
+do_encryption=0
+no_interaction=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --config) 
+            CONFIG_FILES="${CONFIG_FILES} $2"
+	    shift
+            ;;
+    --image)
+            IMAGE="$2"
+	    shift
+            ;;
+    --artifacts)
+            ARTIFACTS_DIR="$2"
+	    shift
+            ;;
+    -v) verbose=t
+            ;;
+    -b) btrfs=1
+            ;;
+    --yes) no_interaction=1
+            ;;
+	--interactive|-i)
+		# Interactive config mode
+		INTERACTIVE_MODE=1
+		for app in blockdev dialog; do
+			verify_utility $app || { echo >&2 "ERROR: $app is not available"; exit 1; }
+		done
+		;;
+    --finaldev) final_dev="$2"
+            shift
+            ;;
+    --ttyconsoledev) ttyconsoledev="$2"
+            shift
+            ;;
+    --ttyconsolecn) ttyconsolecn="$2"
+            shift
+            ;;
+    --partition_layout)
+            FDISK_PARTITION_LAYOUT_INPUT="$2"
+            shift
+            ;;
+    --encrypt)
+            do_encryption=1
+            ;;
+         *) break
+            ;;
+    esac
+    shift
+done
+
+if [ -z "${CONFIG_FILES}" ]; then
+    CONFIG_FILES="config-installer.sh"
+fi
+
+if [ $no_interaction -eq 0 ] && [ -v CONFIRM_INSTALL ] && [ ${CONFIRM_INSTALL} -eq 0 ]; then
+    no_interaction=1
+fi
+
+colon_separated_config_dirs=`echo ${CONFIG_DIRS} | sed 's/ /:/g'`
+for config in ${CONFIG_FILES}; do
+    config_to_source="${config}"
+
+    # check to see if the config exists. If it doesn't search the config paths
+    if ! [ -e "${config}" ]; then
+	for d in ${CONFIG_DIRS}; do
+	    if [ -e "${d}/${config}" ]; then
+		config_to_source="${d}/${config}"
+	    fi
+	done
+
+	if [ -z "${config_to_source}" ]; then
+	    echo "ERROR: Could not find configuration file (${config_to_soure})."
+	    echo "Try using an absolute path or the file must be in one of ($(echo ${CONFIG_DIRS} | tr ' ' ','))."
+	    exit 1
+	fi
+    fi
+    export PATH="$PATH:${colon_separated_config_dirs}:$( dirname $config_to_source )"
+    source `basename ${config_to_source}`
+done
+
+OLDIFS=$IFS
+IFS='
+'
+#source the board specific functions
+if [ -e $SBINDIR/functions-${BOARD_NAME}.sh ]; then
+    debugmsg ${DEBUG_CRIT} "[INFO]: load board ${BOARD_NAME} specific functions"
+    source $SBINDIR/functions-${BOARD_NAME}.sh
+fi
+
+#source any local function definitions
+if [ -e "${LOCAL_POST_FUNCTION_DEFS}" ] ; then
+    source ${LOCAL_POST_FUNCTION_DEFS}
+fi
+
+IFS=$OLDIFS
+
+## typical qemu disk is vdb
+rootfs=$1
+raw_dev=$2
+
+if [ -e "$rootfs" ]; then
+    rootfs=`readlink -f $rootfs`
+else
+    if [ ! -f "${IMAGESDIR}/$rootfs" ]; then
+	debugmsg ${DEBUG_CRIT} "[ERROR]: install rootfs ($rootfs) not found"
+	exit 1
+    fi
+    rootfs="${IMAGESDIR}/$rootfs"
+fi
+
+# remove /dev/ if specified
+raw_dev="`echo ${raw_dev} | sed 's|/dev/||'`"
+
+# Check if interactive mode will be used
+if [ -n "$INTERACTIVE_MODE" ] && [ "$INTERACTIVE_MODE" -eq 1 ]; then
+	if [ -z "$ARTIFACTS_DIR" ] || [ ! -d "$ARTIFACTS_DIR" ]; then
+		ARTIFACTS_DIR=$IMAGESDIR
+	fi
+	debugmsg ${DEBUG_INFO} "Entering interactive mode..."
+	SAVE_CONFIG_FOLDER="saved_config"
+	recursive_mkdir ${SAVE_CONFIG_FOLDER}
+	tmpconf="${SAVE_CONFIG_FOLDER}/config.sh"
+	echo "" > ${tmpconf}
+	promptsdir=${LIBDIR}/prompts
+	INSTALL_TYPE=full
+	for f in `ls $promptsdir`; do
+		source $promptsdir/$f
+		basename=${f%.*}
+		${basename:5}
+		if [ $? -ne 0 ]; then
+			debugmsg ${DEBUG_CRIT} -e "\n\n\nFailed to generate config using interactive mode, run again or specify a config via --config option."
+			exit 1
+		fi
+	done
+
+	debugmsg ${DEBUG_INFO} -e "\n\n\nUser config saved. Installation will continue."
+	debugmsg ${DEBUG_INFO} "You can specify --config ${SAVE_CONFIG_FOLDER}/config.sh option in your later installations to use the exact same configurations."
+	CONFIG_FILES="`pwd`/${SAVE_CONFIG_FOLDER}/config.sh"
+	source $CONFIG_FILES
+fi
+
+if [ ! -d "${IMAGESDIR}" ]; then
+    if [ -n "${ARTIFACTS_DIR}" ]; then
+	IMAGESDIR=${ARTIFACTS_DIR}
+    else
+	debugmsg ${DEBUG_CRIT} "[ERROR]: images dir (${IMAGESDIR}) not found"
+	exit 1
+    fi
+fi
+
+if ! [ -n "$DISTRIBUTION" ]; then
+    DISTRIBUTION="OverC"
+fi
+
+if [ -v CONTAINER_PREFIX -a -n "$CONTAINER_PREFIX" ] ; then
+    export CNAME_PREFIX="--prefix $CONTAINER_PREFIX"
+fi
+
+if [ $do_encryption -eq 1 ] ; then
+    which luks-setup.sh >/dev/null 2>&1
+    if [ $? -eq 1 ]; then
+        echo "WARNING: --encrypt ignored due to missing luks-setup.sh. \
+Install cryptfs-tpm2"
+        do_encryption=0
+    fi
+
+    which cryptsetup >/dev/null 2>&1
+    if [ $? -eq 1 ]; then
+        echo "WARNING: --encrypt ignored due to missing cryptsetup. \
+Install cryptsetup"
+        do_encryption=0
+    fi
+fi
+
+check_required()
+{
+    if [ ! -e "${1}" ]; then
+	x=$(which "${1}")
+	if [ -z "${x}" ]; then
+	    echo "[ERROR]: required command ${1} not found, exiting"
+	    exit 1
+	fi
+    fi
+}
+
+get_container_name_by_prop()
+{
+    local prop=$1
+    local ret=""
+
+    for i in "${!container_map[@]}"; do
+	#echo "key  : $i"
+	#echo "value: ${container_map[$i]}"
+	echo ${container_map[$i]} | grep -qw $prop
+	if [ $? -eq 0 ]; then
+	    ret="${i}"
+	fi
+    done
+
+    echo "${ret}"
+}
+
+get_prop_value_by_container()
+{
+    local cn=$1
+    local prop=$2
+    local ret=""
+
+    props=${container_map[$cn]}
+    for k in $props; do
+        ret=`echo $k | grep "${prop}=" | sed "s/$prop=//g"`
+        if [ -n "$ret" ]; then
+            break
+        fi 
+    done
+
+    echo "${ret}"
+}
+
+get_prop_isset_by_container()
+{
+    local cn=$1
+    local prop=$2
+    local ret=""
+
+    props=${container_map[$cn]}
+    for k in $props; do
+        echo $k | grep -q "${prop}"
+        if [ $? = 0 ]; then
+	    ret=1
+            break
+        fi
+    done
+
+    echo "${ret}"
+}
+
+check_required jq
+
+# containers are listed in HDINSTALL_CONTAINERS as:
+#    <full path>/<container tgz>:<properties>
+declare -g -A container_map=()
+containers_to_check=${HDINSTALL_CONTAINERS}
+if [ -n "$containers_to_check" ]; then
+    create_property_map container_map ${HDINSTALL_CONTAINERS}
+else
+    # if there's a valid containers directory, we'll install everything
+    # found there. Otherwise, we'll use HDINSTALL_CONTAINERS
+    if [ -d "${CONTAINERSDIR}" ]; then
+	for c in $(ls ${CONTAINERSDIR} | grep '\-dom0\-' ; ls ${CONTAINERSDIR} | grep -v '\-dom0\-' ); do
+	    HDINSTALL_CONTAINERS="$HDINSTALL_CONTAINERS `readlink -f ${CONTAINERSDIR}/$c`"
+	done
+    fi
+    create_property_map container_map ${HDINSTALL_CONTAINERS}
+fi
+
+
+# if ttyconsolecn wasn't passed on the command line, check to see
+# if a container in the configuration had the "console" property. If
+# so, set it. Otherwise, assign dom0 as the default
+if [ -z "${ttyconsolecn}" ]; then
+    ttyconsolecn=`get_container_name_by_prop console`
+    if [ -z "${ttyconsolecn}" ]; then
+	ttyconsolecn="dom0"
+    fi
+fi
+
+# create partitions
+# 
+#  1: boot
+#  2: swap
+#  3: root
+#  4. containers
+
+BOOTLABEL="OVERCBOOT"
+SWAPLABEL="SWAP"
+ROOTLABEL="OVERCROOTFS"
+CONTAINERLABEL="OVERCCN"
+
+PARTITIONTYPE=""
+
+if test ! $(which fdisk); then
+	debugmsg ${DEBUG_CRIT} "[ERROR]: Unable to find 'fdisk'."
+	debugmsg ${DEBUG_CRIT} "[ERROR]: Please ensure fdisk is installed and in your PATH."
+	exit 1
+fi
+# Get supported fdisk command line options
+avail_fdisk_options=$(fdisk -h | grep "^\ *-" | cut -d',' -f1 | xargs)
+
+
+if [ -n "${FDISK_PARTITION_LAYOUT_INPUT}" ]; then
+        FDISK_PARTITION_LAYOUT="${FDISK_PARTITION_LAYOUT_INPUT}"
+elif [ -z "${FDISK_PARTITION_LAYOUT}" ]; then
+        FDISK_PARTITION_LAYOUT="${SBINDIR}/fdisk-4-partition-layout.txt"
+        # This fdisk-4-partition-layout.txt file only suitable to mbr partition type,
+        # but not all fdisk versions support -t. So we test and assign if it is available
+
+	# If fdisk supports the '-t' disklabel option use it. Determine which variant to
+	# use, prefer to use 'mbr' when available (though currently the same as 'dos')
+	if [[ $avail_fdisk_options == *"-t"* ]]; then
+		if $(fdisk -t mbr 2>&1 | grep -q unsupported); then
+			PARTITIONTYPE="-t dos"
+		else
+			PARTITIONTYPE="-t mbr"
+		fi
+	fi
+fi
+
+debugmsg ${DEBUG_INFO} "[INFO]: creating partitions using (${FDISK_PARTITION_LAYOUT})"
+debugmsg ${DEBUG_INFO} "          1) boot"
+debugmsg ${DEBUG_INFO} "          2) swap"
+debugmsg ${DEBUG_INFO} "          3) root"
+debugmsg ${DEBUG_INFO} "          4) container"
+# We partition the raw device as passed to the script. This is
+# nuke and pave .. so be careful!
+if [ -f ${FDISK_PARTITION_LAYOUT} ]; then
+        fdisk ${PARTITIONTYPE} /dev/${raw_dev} < ${FDISK_PARTITION_LAYOUT} >/dev/null 2>&1
+else
+        debugmsg ${DEBUG_CRIT} "[ERROR]: Could not find the fdisk partitions file ${FDISK_PARTITION_LAYOUT}"
+        exit 1
+fi
+partprobe /dev/${raw_dev}
+udevadm trigger
+udevadm settle
+# For filesystem creation, we need the partitions. But some devices
+# name them differently than a hard disk (i.e mmcblk or nbd) and 
+# have 'p' in the partion names. In that case, we need to create a
+# separate device with the 'p' and then use it for filesystem 
+# creation.
+fs_dev=${raw_dev}
+if [ $(echo $raw_dev | grep -c 'mmcblk') ==  "1" ]; then
+       fs_dev="${raw_dev}p"
+fi
+if [ $(echo $raw_dev | grep -c 'nbd') ==  "1" ]; then
+       loop_device=t
+       fs_dev="${raw_dev}p"
+fi
+if [ $(echo $raw_dev | grep -c 'loop') ==  "1" ]; then
+       loop_device=t
+       fs_dev="${raw_dev}p"
+       partprobe /dev/${raw_dev}
+       # If partx is available resync all the partitions
+       which partx && partx -d /dev/${raw_dev}
+       which partx && partx -a -v /dev/${raw_dev}
+fi
+
+## create filesystems
+debugmsg ${DEBUG_INFO} "[INFO]: creating filesystems"
+debugmsg ${DEBUG_INFO} "[INFO]: creating swap"
+mkswap -L $SWAPLABEL /dev/${fs_dev}2
+
+set -e
+debugmsg ${DEBUG_INFO} "[INFO]: creating /boot (vfat)"
+#mkfs.vfat -I -n $BOOTLABEL /dev/${fs_dev}1
+
+## define the device file names for rootfs and container filesystem
+rootfs_dev=${fs_dev}3
+container_fs_dev=${fs_dev}4
+
+if [ $do_encryption -eq 1 ]; then
+    ## Evict all objects for the first creation.
+    cmd="luks-setup.sh -f -e -d /dev/${rootfs_dev} -n ${ROOTLABEL}_encrypted"
+    [ $no_interaction -eq 1 ] && cmd="echo Y | $cmd"
+    eval "$cmd"
+    rootfs_dev="mapper/${ROOTLABEL}_encrypted"
+fi
+
+if [ $btrfs -eq 0 ]; then
+    debugmsg ${DEBUG_INFO} "[INFO]: creating / (ext4)"
+    mkfs.ext4 -v -L $ROOTLABEL /dev/${rootfs_dev}
+    mkfs.ext4 -v -L $CONTAINERLABEL /dev/${container_fs_dev}
+else
+    debugmsg ${DEBUG_INFO} "[INFO]: creating / (btrfs)"
+    set +e
+    has_f=`mkfs.btrfs 2>&1 |grep -q '^.*\-f' && echo -f`
+    set -e
+    mkfs.btrfs $has_f -L $ROOTLABEL /dev/${rootfs_dev}
+    mkfs.btrfs $has_f -L $CONTAINERLABEL /dev/${container_fs_dev}
+fi
+set +e
+
+if [ -z "${TMPMNT}" ]; then
+    TMPMNT=`mktemp -d /tmp/pulsarmountXXXXX`
+    export TMPMNT
+fi
+mkdir -p ${TMPMNT}
+mount /dev/${rootfs_dev} ${TMPMNT}
+
+if [ $btrfs -eq 0 ]; then
+	mkdir ${TMPMNT}/boot
+
+	cd ${TMPMNT}
+else
+	# create a subvolume
+	btrfs subvolume create ${TMPMNT}/rootfs
+
+	mkdir ${TMPMNT}/rootfs/boot
+
+	cd ${TMPMNT}/rootfs
+fi
+
+## vfat filesystem doesn't support soft link, here umount boot partition and
+## then copy kernel image to boot partition
+
+# we are either in ${TMPMNT} or ${TMPMNT}/rootfs
+debugmsg ${DEBUG_INFO} "[INFO]: installing rootfs ($rootfs)"
+tar --warning=no-timestamp --numeric-owner \
+    --xattrs --xattrs-include=security\\.ima -xpf "${rootfs}"
+
+if [ -z "${BOOTTMPMNT}" ]; then
+    BOOTTMPMNT=`mktemp -d /tmp/pulsarmountXXXXX`
+    export BOOTTMPMNT
+fi
+mkdir -p ${BOOTTMPMNT}/mnt
+mount /dev/${fs_dev}1 ${BOOTTMPMNT}/mnt
+
+## Process kernel into /boot
+if [ -e "${INSTALL_KERNEL}" ] ; then
+	inst_img=${INSTALL_KERNEL##*}
+	if [ "${inst_img/uImage/}" != "$inst_img" ] ; then
+		inst_kernel=uImage
+	else
+		inst_kernel=bzImage
+	fi
+	cp ${INSTALL_KERNEL} ${BOOTTMPMNT}/mnt/${inst_kernel}
+	cp ${INSTALL_KERNEL} ${BOOTTMPMNT}/mnt/${inst_kernel}_bakup
+	cp ${INSTALL_KERNEL}.p7b ${BOOTTMPMNT}/mnt/${inst_kernel}.p7b
+	cp ${INSTALL_KERNEL}.p7b ${BOOTTMPMNT}/mnt/${inst_kernel}_bakup.p7b
+elif ls boot/uImage-* >/dev/null 2>&1; then
+	cp boot/uImage-* ${BOOTTMPMNT}/mnt/uImage
+	#create a backup kernel for recovery boot
+	cp boot/uImage-* ${BOOTTMPMNT}/mnt/uImage_bakup
+elif ls boot/bzImage-* >/dev/null 2>&1; then
+	name=`basename boot/bzImage-*`
+	cp "boot/$name" ${BOOTTMPMNT}/mnt/bzImage
+	#create a backup kernel for recovery boot
+	cp "boot/$name" ${BOOTTMPMNT}/mnt/bzImage_bakup
+	if [ -f "boot/$name.p7b" ]; then
+		cp "boot/$name.p7b" ${BOOTTMPMNT}/mnt/bzImage.p7b
+		cp "boot/$name.p7b" ${BOOTTMPMNT}/mnt/bzImage_bakup.p7b
+	fi
+elif ls boot/fitImage-* >/dev/null 2>&1; then
+	cp boot/fitImage-* ${BOOTTMPMNT}/mnt/fitImage
+	#create a backup kernel for recovery boot
+	cp boot/fitImage-* ${BOOTTMPMNT}/mnt/fitImage_bakup
+fi
+ 
+## Process initrd into /boot
+img=`ls boot/*Image-* 2> /dev/null`
+# First use the config file specified one, if not set,
+# then find it in ${IMAGESDIR}
+# create both a initrd-<version> and initrd
+if [ -e "$INSTALL_INITRAMFS" ]; then
+	cp $INSTALL_INITRAMFS ${BOOTTMPMNT}/mnt/initrd
+	if [ -f "${INSTALL_INITRAMFS}.p7b" ]; then
+	    cp -f "${INSTALL_INITRAMFS}.p7b" ${BOOTTMPMNT}/mnt/initrd.p7b
+	fi
+elif [ -n "$img" ] ; then
+	debugmsg ${DEBUG_INFO} "[INFO]: installing initramfs ($INSTALL_INITRAMFS)"
+	kernel=`basename boot/*Image-*`
+	kernel_version=`echo $kernel | sed 's/^[^0-9]*-//g'`
+	initrd="initrd-${kernel_version}.gz"
+
+	#Generally in deploy/image dir, there will be several initramfs files
+	#with different name, but they are the same file, so here just copy one
+	#of them is ok.
+	for i in $( ls ${IMAGESDIR}/*-initramfs-*.cpio.gz ); do
+		cp /$i ${BOOTTMPMNT}/mnt/initrd
+		if [ -f "/$i.p7b" ]; then
+		    cp -f "/$i.p7b" ${BOOTTMPMNT}/mnt/initrd.p7b
+		fi
+		break
+	done
+fi
+
+## Deploy kernel modules to overwrite what was there if INSTALL_MODULES is set
+if [ -n "${INSTALL_MODULES}" ]; then
+	debugmsg ${DEBUG_INFO} "[INFO]: installing kernel modules (${INSTALL_MODULES##*/})"
+	tar --numeric-owner -xpf ${INSTALL_MODULES}
+fi
+
+umount ${BOOTTMPMNT}/mnt
+
+if [ $btrfs -eq 1 ]; then
+	# get the subvolume id of /mnt/rootfs using:
+	subvol=`btrfs subvolume list ${TMPMNT} | awk '{print $2;}'`
+	# set default volume when mounted
+	btrfs subvolume set-default $subvol ${TMPMNT}/rootfs
+
+	cd /
+	sync
+	umount ${TMPMNT}/rootfs/mnt
+	umount ${TMPMNT}/
+	mount -o subvolid=${subvol} /dev/${rootfs_dev} ${TMPMNT}
+	mount /dev/${fs_dev}1 ${TMPMNT}/mnt
+	cd ${TMPMNT}/
+fi
+
+# A fixup for virtual installs. If we've booted off a usb device
+# our device will be 'vdb', but since qemu can't re-order bootable
+# devices, vdb goes away when a reboot happens and you want to boot
+# the install. In that case, vdb becomes vda. So we switch it below
+# here to avoid fixups during first boot.
+if [ -z ${final_dev} ]; then
+    final_dev=${raw_dev}
+    if [ "${raw_dev}" = "vdb" ]; then
+	final_dev="vda"
+    fi
+fi
+
+if ${X86_ARCH}; then
+    debugmsg ${DEBUG_INFO} "[INFO]: installing grub"
+
+    chroot ${TMPMNT} /bin/bash -c "mount -t devtmpfs none /dev"
+    chroot ${TMPMNT} /bin/bash -c "mount -t proc proc /proc"
+    chroot ${TMPMNT} /bin/bash -c "mount -t sysfs sys /sys"
+
+    if [ -n "$loop_device" ]; then
+	chroot ${TMPMNT} /bin/bash -c "grub-install --target=i386-pc --force --boot-directory=/mnt --modules=\" boot linux ext2 fat serial part_msdos part_gpt normal iso9660 search chain\" /dev/${raw_dev}"
+    else
+	chroot ${TMPMNT} /bin/bash -c "grub-install --target=i386-pc --boot-directory=/mnt --force /dev/${raw_dev}"
+    fi
+
+    mkdir -p ${TMPMNT}/mnt/grub
+    cat <<EOF >${TMPMNT}/mnt/grub/grub.cfg
+set default="0"
+
+serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1
+terminal_input console serial
+terminal_output console serial
+set timeout=5
+
+menuentry "$DISTRIBUTION" {
+	insmod gzio
+	insmod ext2
+	insmod fat
+	search --no-floppy --label OVERCBOOT --set=root 
+	echo	'Loading Linux ...'
+	linux	/bzImage root=LABEL=OVERCROOTFS ro rootwait $GRUB_KERNEL_PARAMS
+	echo	'Loading initial ramdisk ...'
+	initrd	/initrd
+}
+
+menuentry "$DISTRIBUTION recovery" {
+        insmod gzio
+        insmod ext2
+        insmod fat
+        search --no-floppy --label OVERCBOOT --set=root 
+        echo    'Loading Linux ...'
+        linux   /bzImage_bakup root=LABEL=OVERCROOTFS rootflags=subvol=rootfs_bakup ro rootwait $GRUB_RECOVERY_KERNEL_PARAMS
+        echo    'Loading initial ramdisk ...'
+        initrd  /initrd
+}
+
+EOF
+
+    debugmsg ${DEBUG_INFO} "[INFO]: grub installed"
+    
+    # fixups for virtual installs
+    if [ "${raw_dev}" = "vdb" ]; then
+	sed -i "s/${raw_dev}/${final_dev}/" ${TMPMNT}/boot/grub/grub.cfg
+    fi
+
+    if [ -f boot/efi/EFI/BOOT/boot*.efi ]; then
+	debugmsg ${DEBUG_INFO} "[INFO]: installing EFI artifacts"
+	mkdir -p ${TMPMNT}/mnt/EFI/BOOT
+	cp -a boot/efi/EFI ${TMPMNT}/mnt
+
+	if [ -n "${INSTALL_GRUBEFI_CFG}" -a -f "${INSTALL_GRUBEFI_CFG}" ]; then
+	    cp "${INSTALL_GRUBEFI_CFG}" ${TMPMNT}/mnt/EFI/BOOT/grub.cfg
+	elif [ ! -f ${TMPMNT}/mnt/EFI/BOOT/grub.cfg ]; then
+	    cat <<EOF >${TMPMNT}/mnt/EFI/BOOT/grub.cfg
+set default="0"
+set timeout=5
+set color_normal='light-gray/black'
+set color_highlight='light-green/blue'
+
+menuentry "$DISTRIBUTION" {
+       chainloader /bzImage root=LABEL=OVERCROOTFS ro rootwait initrd=/initrd
+}
+
+menuentry "$DISTRIBUTION recovery" {
+       chainloader /bzImage_bakup root=LABEL=OVERCROOTFS rootflags=subvol=rootfs_bakup ro rootwait initrd=/initrd
+}
+
+menuentry 'Automatic Key Provision' {
+       chainloader /EFI/BOOT/LockDown.efi
+}
+EOF
+	fi
+
+	echo `basename ${TMPMNT}/mnt/EFI/BOOT/boot*.efi` >${TMPMNT}/mnt/startup.nsh
+	chmod +x ${TMPMNT}/mnt/startup.nsh
+    else
+	install -m 0755 ${SBINDIR}/startup.nsh ${TMPMNT}/mnt/
+	sed -i "s/%ROOTLABEL%/${ROOTLABEL}/" ${TMPMNT}/mnt/startup.nsh
+	sed -i "s/%INITRD%/${initrd}/" ${TMPMNT}/mnt/startup.nsh
+	sed -i "s/%BZIMAGE%/bzImage/" ${TMPMNT}/mnt/startup.nsh
+    fi
+else # arm architecture
+    if [ -e "${INSTALL_DTB}" ]; then
+        install_dtb "${TMPMNT}/mnt" "${INSTALL_DTB}"
+    elif [ -e "${IMAGESDIR}/dtb" ]; then
+        install_dtb "${TMPMNT}/mnt" "${IMAGESDIR}/dtb"
+    fi
+    if [ -e "${INSTALL_BOOTLOADER}" ]; then
+        if [ -e "${INSTALL_BOOTLOADER_ENV}" ]; then
+	    install_bootloader "${raw_dev}" "${TMPMNT}/mnt" ${INSTALL_BOOTLOADER} "${BOARD_NAME}" ${INSTALL_BOOTLOADER_ENV}
+        else
+	    install_bootloader "${raw_dev}" "${TMPMNT}/mnt" ${INSTALL_BOOTLOADER} "${BOARD_NAME}"
+	fi
+    elif [ -e ${IMAGESDIR}/*_boot.bin ]; then
+	BOARD_NAME=`basename ${IMAGESDIR}/*_boot.bin | sed 's/_boot\.bin//'`
+	install_bootloader "${raw_dev}" "${TMPMNT}/mnt" "${IMAGESDIR}/${BOARD_NAME}_boot.bin" "${BOARD_NAME}"
+    fi
+fi
+
+# Remove the systemd's costly remount of the root partition from /etc/fstab,
+# and also remove API filesystems mounting from it, as systemd will mount them itself.
+# sed -i '\/dev\/root/d' ${TMPMNT}/etc/fstab
+sed -i '/^proc/d' ${TMPMNT}/etc/fstab
+sed -i '/^devpts/d' ${TMPMNT}/etc/fstab
+sed -i '/^tmpfs/d' ${TMPMNT}/etc/fstab
+sed -i '/^usbdevfs/d' ${TMPMNT}/etc/fstab
+
+# Setup any systemd serial/screen getty by removing all getty definitions first
+# and replacing by definition from the install template
+find ${TMPMNT}/etc/systemd/system/getty.target.wants |egrep -e "(serial-getty|screen-getty)" |xargs rm -f
+if [ "${SCREEN_GETTY_CONSOLE}" != "" ] ; then
+    con=${SCREEN_GETTY_CONSOLE%,*}
+    baud=${SCREEN_GETTY_CONSOLE#*,}
+    systemd_getty=/lib/systemd/system/screen-getty@.service
+    if [ "${baud}" != "" -a "${baud}" != "115200" ] ; then
+	cp ${TMPMNT}/lib/systemd/system/screen-getty@.service ${TMPMNT}/lib/systemd/system/screen-getty-$baud@.service
+	perl -p -i -e "s/(screen-getty \%I) .*? /\$1 $baud /" ${TMPMNT}/lib/systemd/system/screen-getty@.service
+	ln -sf /lib/systemd/system/screen-getty-$baud@.service ${TMPMNT}/etc/systemd/system/getty.target.wants/screen-getty-$baud@$con.service
+    else
+	ln -sf /lib/systemd/system/screen-getty@.service ${TMPMNT}/etc/systemd/system/getty.target.wants/screen-getty@$con.service
+    fi
+fi
+
+echo "LABEL=$SWAPLABEL none swap sw 0 0" >> ${TMPMNT}/etc/fstab
+echo "LABEL=$BOOTLABEL /boot auto defaults 0 0" >> ${TMPMNT}/etc/fstab
+echo "LABEL=$CONTAINERLABEL /opt/container auto defaults 0 0" >> ${TMPMNT}/etc/fstab
+
+if [ -e /${IMAGESDIR}/config.smart ]; then
+    INSTALL_SMARTCONFIG="/${IMAGESDIR}/config.smart"
+fi
+
+if [ -e "$INSTALL_SMARTCONFIG" ]; then
+    if [ -d ${TMPMNT}/var/lib/smart ]; then
+        cp $INSTALL_SMARTCONFIG ${TMPMNT}/var/lib/smart/config
+    elif [ -d ${TMPMNT}/etc/dnf ]; then
+        cp $INSTALL_SMARTCONFIG ${TMPMNT}/etc/dnf/dnf.conf
+    fi
+fi
+
+# make essential system use vty 1 to login and disable the autoVTs of systemd
+sed -i "s/#NAutoVTs=.*$/NAutoVTs=0/g" ${TMPMNT}/etc/systemd/logind.conf
+sed -i "s/#ReserveVT=.*$/ReserveVT=0/g" ${TMPMNT}/etc/systemd/logind.conf
+gettys=$( ls ${TMPMNT}/etc/systemd/system/getty.target.wants/getty* )
+for k in ${gettys}; do
+	ln -s -f /dev/null ${k}
+done
+ln -sf /lib/systemd/system/getty@.service ${TMPMNT}/etc/systemd/system/getty.target.wants/getty@tty1.service
+
+# Disable all not needed services in essentail
+if [ -n "${SERVICE_DISABLE_ESSENTIAL}" ]; then
+    for s in ${SERVICE_DISABLE_ESSENTIAL}; do
+        service_disable ${s}
+    done
+fi
+
+# arg1: container storage path
+# arg2: container name
+# arg3: whether or not prep should be run
+regen_container_config() {
+    local outdir=$1
+    local cname=$2
+    local prep_flag=$3
+
+    (
+	cd ${outdir}${cname}
+	if [ -e "pflask.cmd" ]; then
+	    ${SBINDIR}/cube-cfg gen ${cname}:cube
+	else
+	    ${SBINDIR}/cube-cfg gen ${cname}:oci
+	fi
+
+	if [ -n "${prep_flag}" ]; then
+	    ${SBINDIR}/cube-ctl prep -n ${cname} -o ${outdir}
+	fi
+    )
+}
+
+
+if [ -n "${HDINSTALL_CONTAINERS}" ]; then
+    subvol=""
+    debugmsg ${DEBUG_INFO} "[INFO] installing containers"
+    if [ ! -d ${TMPMNT}/opt/container ]; then
+        mkdir -p ${TMPMNT}/opt/container
+    fi
+    mount /dev/${container_fs_dev} ${TMPMNT}/opt/container
+
+    mkdir -p ${TMPMNT}/tmp
+
+    if [ $btrfs -eq 1 ]; then
+        #create a subvolume for container images
+        btrfs subvolume create ${TMPMNT}/opt/container/workdir
+        subvol=`btrfs subvolume list ${TMPMNT}/opt/container | awk '{print $2;}'`
+        sync
+        umount ${TMPMNT}/opt/container
+        mount -o subvol=workdir /dev/${container_fs_dev} ${TMPMNT}/opt/container
+    fi
+
+    # deal with static IPs and the "Networking Prime"
+    network_offsets=()
+    network_container=()
+
+    CNRECORD=`mktemp /tmp/hdcontainerXXXXX`
+    export CNRECORD
+
+    for c in `strip_properties ${HDINSTALL_CONTAINERS}`; do
+	cname=`${SBINDIR}/cubename $CNAME_PREFIX $c`
+	# Just save a record in tmp file
+	mergepath=`get_prop_value_by_container $cname "mergepath"`
+
+	echo "$cname::$mergepath" >> ${CNRECORD}
+    done;
+
+    for c in `strip_properties ${HDINSTALL_CONTAINERS}`; do
+	debugmsg ${DEBUG_INFO} "[INFO] installing $c"
+
+	# containers names are "prefix-<container name>-<... suffixes >
+	container_src=`basename $c`
+	cname=`${SBINDIR}/cubename $CNAME_PREFIX $c`
+	cp $c ${TMPMNT}/tmp/
+	cp ${SBINDIR}/cube-ctl ${TMPMNT}/tmp/
+
+	# If a net offset is specified for this container add
+	# it to the network_offsets list in the overc_config_vars.yml
+	# in order to have ansible configure the container.
+	# An offset of '1' will make that container the
+	# "network prime".
+	net_offset=`get_prop_value_by_container $cname "net"`
+	if [ -n "$net_offset" ]; then
+	    if [ $net_offset -eq 1 ]; then
+		network_prime="$cname"
+	    else
+		network_offsets+=("'$net_offset'")
+		network_container+=("'$cname'")
+	    fi
+	fi
+
+	# if subuid property is specified for this container,
+	# this container is going to be unprivileged.
+	subuid=`get_prop_value_by_container $cname "subuid"`
+	subuid_opt=""
+	if [ -n "${subuid}" ]; then
+		subuid_opt="-u ${subuid}"
+		echo "root:${subuid}:65536" >> ${TMPMNT}/etc/subuid
+		echo "root:${subuid}:65536" >> ${TMPMNT}/etc/subgid
+	fi
+
+	# actually install the container
+	export CONTAINERBASE="${TMPMNT}/opt/container"
+	export RUNBASE="/var/lib/cube"
+	export BINDMNTBASE="${TMPMNT}${RUNBASE}"
+	export HOSTDIR="${TMPMNT}"
+
+	# we bind mount /var/lib/container (essential) to
+	# /opt/container/var/lib/container (dom0) for the installer.  Since
+	# dom0 will always run with this bind mount, it allows cube-ctl add
+	# to work the same where here, and at runtime
+	mkdir -p ${CONTAINERBASE}/${RUNBASE}
+	mkdir -p ${BINDMNTBASE}
+	mount --bind ${BINDMNTBASE} ${CONTAINERBASE}/${RUNBASE}
+
+	case $container_src in
+	    *-dom0-*)
+		${SBINDIR}/cube-ctl add --track --auto essential -n ${cname} -t cube -o ${CONTAINERBASE} ${c}
+		;;
+	    *)
+		${SBINDIR}/cube-ctl add --track --auto dom0 -n ${cname} -t oci -o ${CONTAINERBASE} ${c}
+		;;
+	esac
+
+	# undo the bind mount
+	umount ${CONTAINERBASE}/${RUNBASE}
+	rm -rf ${CONTAINERBASE}/var
+
+	if [ -e "$INSTALL_SMARTCONFIG" ]; then
+            if [ -d ${TMPMNT}/opt/container/$cname/rootfs/var/lib/smart ]; then
+                cp $INSTALL_SMARTCONFIG ${TMPMNT}/opt/container/$cname/rootfs/var/lib/smart/config
+            elif [ -d ${TMPMNT}/opt/container/$cname/rootfs/etc/dnf ]; then
+                cp $INSTALL_SMARTCONFIG ${TMPMNT}/opt/container/$cname/rootfs/etc/dnf/dnf.conf
+            fi
+        fi
+
+	rm ${TMPMNT}/tmp/$(basename $c)
+    done
+
+    #cleanup temp files
+    rm ${CNRECORD}
+
+    # install and modify per-container configurations
+    for c in `strip_properties ${HDINSTALL_CONTAINERS}`; do
+	container_src=`basename $c`
+	cname=`${SBINDIR}/cubename $CNAME_PREFIX $c`
+
+	devicemgr=`get_prop_value_by_container ${cname} "cube.device.mgr"`
+	if [ "${devicemgr}" = "self" ]; then
+	    (
+		cd ${TMPMNT}/opt/container/${cname}
+		${SBINDIR}/cube-cfg set cube.device.mgr:self
+	    )
+	fi
+
+	# TTY/console processing
+	# Any container that has a console attribute gets a virtual console
+	consoleattr=`get_prop_isset_by_container $cname "console"`
+	# hardconsole means a container gets the physical console device
+	hardconsoleattr=`get_prop_isset_by_container $cname "hardconsole"`
+
+	# ttyconsoldev comes from the parameters to this installer
+	if [ "${ttyconsolecn}" == "${cname}" -o -n "$consoleattr" ]; then
+	    (
+		cd ${TMPMNT}/opt/container/${cname}
+		${SBINDIR}/cube-cfg set cube.console.mgr:screen-tty
+		regen_container_config ${TMPMNT}/opt/container/ ${cname}
+	    )
+	else
+	    (
+		cd ${TMPMNT}/opt/container/${cname}
+		${SBINDIR}/cube-cfg set cube.console.mgr:tty
+		regen_container_config ${TMPMNT}/opt/container/ ${cname}
+	    )
+	fi
+
+	# vty attributes are: <number>,<properites>
+	# properties: active or <empty>
+	vty_num=`get_prop_value_by_container ${cname} "vty"`
+	foreground_container=
+	foreground_vty=
+	if [ -n "$vty_num" ]; then
+	    attribute1=`echo $vty_num | cut -f1 -d,`
+	    attribute2=`echo $vty_num | cut -f2 -d,`
+	    if [ "$attribute1" != "$attribute2" ]; then
+		# they are different, so ther's a number,<attribute>
+		vty_num="${attribute1}"
+		vty_prop="${attribute2}"
+		if [ "${vty_prop}" == "active" ]; then
+		    foreground_container="${cname}"
+		    foreground_vty="${vty_num}"
+		fi
+	    fi
+
+	    (
+		cd ${TMPMNT}/opt/container/${cname}
+		${SBINDIR}/cube-cfg device vt:/dev/tty${vty_num}:/dev/tty${vty_num}
+		regen_container_config ${TMPMNT}/opt/container/ ${cname} prep
+	    )
+	fi
+
+	# if there was a foreground container defined (attribute 'active' on a vty), then we
+	# install a chvt service to make sure it is in the foreground after boot. Note, this
+	# currently does not touch essential, but could in the future.
+	if [ -n "${foreground_container}" ]; then
+	    service_install chvt.service ${cname}
+	    service_modify "%OVERC_ACTIVE_VT%" ${foreground_vty} ${cname} chvt.service
+	fi
+
+        # Disable all not needed services in dom0
+        if [ -n "${SERVICE_DISABLE_DOM0}" -a "${cname}" = "dom0" ]; then
+            for s in ${SERVICE_DISABLE_DOM0}; do
+                service_disable ${s} ${cname}
+            done
+        fi
+
+        # Disable or add condition checking for all not needed services in container
+        if [ -n "${SERVICE_DISABLE_CONTAINER}" ]; then
+            for s in ${SERVICE_DISABLE_CONTAINER}; do
+                service_disable ${s} ${cname}
+            done
+        fi
+
+        if [ -n "${SERVICE_CONDITION_CONTAINER}" ]; then
+            for s in ${SERVICE_CONDITION_CONTAINER}; do
+                service_add_condition_for_container ${s} ${cname}
+            done
+        fi
+
+	if [ -e "${TMPMNT}/opt/container/${cname}/pflask.cmd" ]; then
+	    (
+		cd ${TMPMNT}/opt/container/${cname}
+		echo "[INFO]: setting up basic networking for cube ${cname}"
+
+		# TODO: this should move into cube-ctl as hook calls, since without that
+		#       you can only install cubes via the installer.
+
+		# We need a veth so we can connect to the ovs bridge
+		${SBINDIR}/cube-cfg device network-virt:veth-${cname}:veth-${cname}
+		${SBINDIR}/cube-cfg hook-script poststart:/usr/libexec/cube/hooks.d/cube-network up
+
+		if [ "${cname}" = "dom0" ]; then
+		    ${SBINDIR}/cube-cfg device vt:/dev/loop-control:/dev/loop-control
+		    ${SBINDIR}/cube-cfg device vt:/dev/loop0:/dev/loop0
+		    ${SBINDIR}/cube-cfg device vt:/dev/loop1:/dev/loop1
+		    ${SBINDIR}/cube-cfg device vt:/dev/loop2:/dev/loop2
+
+		    ${SBINDIR}/cube-cfg set cube.network.type:static
+		    ${SBINDIR}/cube-cfg set cube.network.ip:192.168.42.3/24
+		    ${SBINDIR}/cube-cfg attribute +vrf
+		    ${SBINDIR}/cube-cfg hook-script poststart:/usr/libexec/cube/hooks.d/cube-netconfig vrf
+		    service_disable systemd-resolved.service ${cname}
+		fi
+
+		${SBINDIR}/cube-cfg gen ${cname}:cube
+	    )
+	fi
+    done
+
+    # Setup networking prime and static IPs, unless using bridged networking
+    if [ ! -v network_prime ]; then
+	# TODO: remove this case, it is no longer supported .. or fix it
+	# Fallback to using bridged networking (see overc_bridge_networking DISTRO_FEATURE)
+	sed -i "s/^configure_network_prime/#configure_network_prime/"  \
+	    ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+	debugmsg ${DEBUG_INFO} "[INFO]: Using bridged networking."
+    else
+	if [ ! -v NETWORK_DEVICE ]; then
+	    NETWORK_DEVICE=""
+	fi
+
+	pathtocontainer=${TMPMNT}/opt/container/${network_prime}
+	if [ -e "${pathtocontainer}/config.json" ]; then
+	    # Pass the network device through to the designated network prime container
+	    if [ -n "${NETWORK_DEVICE}" ]; then
+		echo "[INFO]: adding ${NETWORK_DEVICE} to network prime"
+		(
+		    cd ${TMPMNT}/opt/container/${network_prime}
+
+		    # basic networking is taken care of in the loops above, here, we just
+		    # need to pass through the physical device
+		    ${SBINDIR}/cube-cfg set cube.network.type:static
+		    ${SBINDIR}/cube-cfg --prepend set cube.network.ip:192.168.42.1/24
+		    for n in ${NETWORK_DEVICE}; do
+			${SBINDIR}/cube-cfg device network:${n}:${n}
+		    done
+		    ${SBINDIR}/cube-cfg attribute +netprime
+
+		    # ensure that etcd (on dom0) is accessible
+		    ${SBINDIR}/cube-cfg -v link ${network_prime}:2379 dom0:2379
+
+		    if [ -e "pflask.cmd" ]; then
+			${SBINDIR}/cube-cfg hook-script poststart:/usr/libexec/cube/hooks.d/cube-netconfig netprime
+			${SBINDIR}/cube-cfg gen ${network_prime}:cube
+			service_disable systemd-resolved.service ${cname}
+		    else
+			${SBINDIR}/cube-cfg hook-script poststart:/usr/libexec/cube/hooks.d/cube-netconfig netprime \$\(cat\)
+			${SBINDIR}/cube-cfg gen ${network_prime}:oci
+			service_disable systemd-resolved.service ${cname}
+		    fi
+		)
+	    fi
+
+	    # Enable configuring the network prime container by ansible on first boot
+	    sed -i "s/^\(network_prime_container:\).*$/\1 ${network_prime}/" \
+		${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+
+	    # Set the network prime device for network prime container by ansible on first boot
+	    if [ ! -z "${NETWORK_DEVICE}" ]; then
+                sed -i "s/^\(network_device:\).*$/\1 ${NETWORK_DEVICE}/" \
+		    ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+	    else
+                sed -i "s/^network_device/#network_device/"  \
+	            ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+	    fi
+
+	    # TODO: These are no longer used and can likely be dropped. The static
+	    #       networking has moved to hooks and not ansible.
+	    if [ -v network_offsets ] && [ ${#network_offsets[@]} -gt 0 ]; then
+		network_offsets=$(IFS=,; echo "${network_offsets[*]}")
+		network_container=$(IFS=,; echo "${network_container[*]}")
+
+		sed -i "s/^\(cname\: \).*\]$/\1 \[$network_container\]/" \
+		    ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+
+		sed -i "s/^\(coffset\: \).*\]$/\1 \[$network_offsets\]/" \
+		    ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+	    fi
+
+	    debugmsg ${DEBUG_INFO} "[INFO]: Set ${network_prime} as the network prime."
+	else
+	    debugmsg ${DEBUG_WARN} "[WARNING]: Invalid network prime defined."
+	fi
+    fi
+
+    # setup timezone if it is configured
+    if [ ! -z "${TIMEZONE}" ]; then
+	debugmsg ${DEBUG_INFO} "[INFO]: Set ${TIMEZONE} as the timezone."
+	echo "timezone: ${TIMEZONE}" >> ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+    fi
+
+    # setup initial user if it is configured
+    if [ ! -z "${INITIAL_USER}" ]; then
+	debugmsg ${DEBUG_INFO} "[INFO]: Set initial user."
+	sed -i "s/^\(initial_user:\).*$/\1 ${INITIAL_USER}/" \
+	    ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+            if [ ! -z "${INITIAL_PASSWD}" ]; then
+	        debugmsg ${DEBUG_INFO} "[INFO]: Set initial password."
+	        echo "initial_passwd: ${INITIAL_PASSWD}" \
+	            >> ${TMPMNT}/etc/overc-conf/ansible/overc_config_vars.yml
+            fi
+    fi
+
+    if [ -n "${LOCAL_CUSTOM_HDD_POST_FUNCS}" ]; then
+	for f in ${LOCAL_CUSTOM_HDD_POST_FUNCS}; do
+	    ${f}
+	done
+    fi
+
+    #
+    # prepare the firmware in essential
+    #
+    # The config* should set the FIRMWARE_INSTALL variable to the list of firmware
+    # elements that should be pre-populated to essential. '*' will copy all of
+    # the available firmware
+    #
+    if [ -n "${FIRMWARE_INSTALL}" ]; then
+	if [ $(readlink ${TMPMNT}/lib/firmware) ]; then
+            if [ ! -d ${TMPMNT}/var/lib/cube/essential/lib/firmware ]; then
+		mkdir -p ${TMPMNT}/var/lib/cube/essential/lib/firmware
+	    fi
+	    # we don't want '*' to expand in the variable
+	    set -f
+	    for f in ${FIRMWARE_INSTALL}; do
+		# but we do want it to expand here
+		set +f
+		cp -a ${TMPMNT}/opt/container/dom0/rootfs/lib/firmware/${f} ${TMPMNT}/var/lib/cube/essential/lib/firmware/
+	    done
+	    # in case the loop didn't iterate, lets put things back
+	    set +f
+	fi
+    fi
+
+    sync
+    umount ${TMPMNT}/opt/container
+
+    if [ $btrfs -eq 1 ]; then
+        if [ -z "$subvol" ]; then
+            debugmsg ${DEBUG_WARN} "[WARNING]: Could not get subvolume id, thus cannot create factory reset snapshot"
+        else
+            mount /dev/${container_fs_dev} ${TMPMNT}/opt/container
+            btrfs subvolume set-default $subvol ${TMPMNT}/opt/container
+            btrfs subvolume snapshot ${TMPMNT}/opt/container/workdir ${TMPMNT}/opt/container/${FACTORY_SNAPSHOT}
+            #snapshot subvolume recursively
+            subvolumes="$(btrfs subvolume list -c ${TMPMNT}/opt/container/workdir | awk '{print $NF}')"
+            for subvolume in $subvolumes; do
+                snapshot_directory="${TMPMNT}/opt/container/${FACTORY_SNAPSHOT}/${subvolume}"
+                if [ -d "${snapshot_directory}" ]; then
+                    rm -rf "${snapshot_directory}"
+                    btrfs subvolume snapshot "${TMPMNT}/opt/container/workdir/${subvolume}" "${TMPMNT}/opt/container/${FACTORY_SNAPSHOT}/$(dirname ${subvolume})"
+                fi
+            done
+            sync 
+            umount ${TMPMNT}/opt/container
+        fi
+    fi
+fi
+
+if [ -d "${PACKAGESDIR}" ]; then
+    debugmsg ${DEBUG_INFO} "[INFO]: Copying packages to installation as /opt/packages"
+    mkdir -p opt/
+    cp -r ${PACKAGESDIR} opt/
+
+    chroot . /bin/bash -c "\\
+smart channel -y --add all type=rpm-md baseurl=file://opt/packages/rpm/all/; \\
+smart channel -y --add core2_64 type=rpm-md baseurl=file://opt/packages/rpm/core2_64/; \\
+smart channel -y --add genericx86_64 type=rpm-md baseurl=file://opt/packages/rpm/genericx86_64; \\
+smart channel -y --add lib32_x86 type=rpm-md baseurl=file://opt/packages/rpm/lib32_x86/; \\
+smart update"
+
+fi
+
+debugmsg ${DEBUG_INFO} "[INFO]: performing cleanup"
+# cleanup
+cd /
+sync
+umount ${TMPMNT}/mnt
+
+cat /proc/mounts | grep -q "${TMPMNT}/dev"
+if [ $? -eq 0 ]; then
+	umount ${TMPMNT}/dev
+fi
+cat /proc/mounts | grep -q "${TMPMNT}/proc"
+if [ $? -eq 0 ]; then
+	umount ${TMPMNT}/proc
+fi
+cat /proc/mounts | grep -q "${TMPMNT}/sys"
+if [ $? -eq 0 ]; then
+	umount ${TMPMNT}/sys
+fi
+
+umount ${TMPMNT}
+if [ $? -ne 0 ]; then
+   echo ERROR: umount ${TMPMNT} failed
+   exit 1
+fi
+
+#create a backup snapshot for rootfs
+if [ $btrfs -eq 0 ]; then
+	:
+else
+	debugmsg ${DEBUG_INFO} "[INFO]: Creating a snapshot of rootfs for recovery."
+	#mount the root subvolume
+	mount -o subvolid=5 /dev/${rootfs_dev} ${TMPMNT}
+	if [ -e "${TMPMNT}/rootfs" ]; then
+		btrfs subvolume snapshot ${TMPMNT}/rootfs ${TMPMNT}/rootfs_bakup
+		btrfs subvolume snapshot ${TMPMNT}/rootfs ${TMPMNT}/${FACTORY_SNAPSHOT}
+	fi
+	sync
+	umount ${TMPMNT}
+	if [ $? -ne 0 ]; then 
+	    echo ERROR: umount ${TMPMNT} failed
+	    exit             
+	fi
+fi
+
+rmdir ${TMPMNT}
+
+if [ $do_encryption -eq 1 ]; then
+    echo "INFO: Closing LUKS ..."
+
+    cryptsetup luksClose "${ROOTLABEL}_encrypted"
+fi
+
+# don't run this on a host!!
+# sync ; sync ; echo 3> /proc/sys/vm/drop_caches
+# echo o > /proc/sysrq-trigger

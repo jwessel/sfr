@@ -82,3 +82,57 @@ cp -a /tmp/b/EFI/BOOT/* /tmp/a/EFI/BOOT
 umount /tmp/a /tmp/b
 umount /boot
 reboot
+
+
+####################################################
+# Notes for use for upgrade with existing disk
+# where the install image uses OS Tree
+####################################################
+
+make CONFIG=config_ostree_xd10_efi \
+   SOURCE_IMAGE=/INSTALL_IMAGE \
+   SELSIGN_TOOLS=/PATH_TO_SELSIGN/usr/bin \
+   PRIV_KEY=/PATH_TO_PRIV_KEY/vendor_cert.key \
+   PUB_KEY=/PATH_TO_PUB_KEY/vendor_cert.crt
+
+(rm -f upgrade.tar ; cd efi_vol ; tar -cvf ../upgrade.tar *)
+
+# Test with kvm if you have a disk image
+# Disk is an image of the disk you want to updgrade
+kvm -drive file=disk.qcow2,if=virtio \
+    -drive file=pflash,format=raw,if=pflash,id=flash -nographic -vnc :7  -m 2048  \
+    -netdev type=user,id=h1,hostfwd=tcp::7440-10.0.2.15:22,hostfwd=tcp::7441-10.0.2.15:2222 \
+    -device e1000,netdev=h1,mac=00:55:55:01:01:01,romfile= \
+    -bios pflash -serial telnet::7444,server,nowait \
+    -serial telnet::7445,server,nowait -serial mon:stdio 
+
+
+## Testing with an on target system ##
+
+## Build deploy image
+(cd efi_vol ; tar -cjf ../upgrade.tar.bz2 *)
+
+## Special instructions to run on target system from cube-essential
+
+DEV=/dev/sda
+### NOTE This destroys the data on the partition, if
+### you need to save it, you need to call resize2fs.
+### The idea is to use the last 2GB of the disk
+parted ---pretend-input-tty ${DEV} resizepart 9 455GB Yes
+parted --script ${DEV} mkpart logical fat32 455GB 457GB
+sync
+partprobe ${DEV}
+mkfs.vfat -F32 -I -n OVERCSFR ${DEV}10
+sync
+mkdir /tmp/a
+mkdir /tmp/b
+mount ${DEV}1 /tmp/a
+mount ${DEV}10 /tmp/b
+cp -a /tmp/a/* /tmp/b
+# Pulsar 8 command
+/var/lib/lxc/cube-gw/rootfs/usr_temp/bin/curl http://SOME_SERVER/upgrade.tar.bz2 | tar -C /tmp/b -xjvf -
+cp /tmp/b/up* /tmp/a
+cp -a /tmp/b/EFI/BOOT/* /tmp/a/EFI/BOOT
+umount /tmp/a /tmp/b
+umount /boot
+reboot

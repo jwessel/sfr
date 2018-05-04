@@ -44,23 +44,32 @@ step4=${step4=1}
 if [ $step1 = 1 ] ; then
     dev=`losetup -f --show ${SOURCE_IMAGE}`
     partprobe ${dev}
-    mkdir -p t
-    mount ${dev}p2 t
-    mount ${dev}p1 t/boot
+    mkdir -p t_rootfs t_efi t_flux
+    mount ${dev}p1 t_efi
+    mount ${dev}p2 t_rootfs
+    mount ${dev}p3 t_flux
     rm -rf efi_vol
     mkdir efi_vol
-    rsync -a -v t/opt/installer/ efi_vol/installer/
-    rsync -a -v t/boot/EFI/ efi_vol/EFI/
-    cp t/boot/images/bzImage efi_vol/up-bzImage
-    cp t/boot/images/bzImage.p7b efi_vol/up-bzImage.p7b
-    cp t/boot/images/initrd efi_vol/up-initrd
-    cp t/boot/images/initrd.p7b efi_vol/up-initrd.p7b
+    rsync -a -v t_efi/EFI/ efi_vol/EFI/
     rm -rf initrd-extras
     mkdir -p initrd-extras
-    (cd t ; tar -cf - usr/lib64/libgpg* usr/lib64/libgcrypt* usr/lib64/liblzma* usr/bin/xargs* lib/systemd/libsystemd* lib64/libsystemd* usr/lib64/liblzo* usr/bin/systemd-detect-virt usr/bin/*btrfs* usr/lib64/*btrfs* usr/bin/find* usr/sbin/mkfs* usr/bin/mkfs* usr/bin/whic* usr/bin/jq usr/lib64/libjq* | tar -C ../initrd-extras -xvf -)
-    umount t/boot t
+    mydir=$PWD
+    (cd t_rootfs/boot/0/ostree ; tar -cf - usr/sbin/fatlabel* usr/bin/tar* usr/bin/which* bin/bash* bin/sh usr/bin/bash* usr/bin/setsid* usr/lib64/libcom_err* usr/lib64/libe2p* usr/lib64/libext2fs* usr/lib64/libgpg* usr/lib64/libgcrypt* usr/lib64/liblzma* usr/bin/xargs* lib/systemd/libsystemd* lib64/libsystemd* usr/lib64/liblzo* usr/bin/systemd-detect-virt usr/bin/*btrfs* usr/lib64/*btrfs* usr/bin/find* usr/sbin/mkfs* usr/bin/mkfs* usr/bin/whic* usr/bin/jq usr/lib64/libjq* | tar -C $mydir/initrd-extras -xvf -)
+    # Copy boot files
+    f_loc=`readlink t_rootfs/boot/0/boot`
+    cp t_rootfs/$f_loc/vmlinuz efi_vol/up-bzImage
+    cp t_rootfs/$f_loc/vmlinuz.p7b efi_vol/up-bzImage.p7b
+    cp t_rootfs/$f_loc/initramfs efi_vol/up-initrd
+    cp t_rootfs/$f_loc/initramfs.p7b efi_vol/up-initrd.p7b
+    # Copy Install files
+    mkdir -p efi_vol/installer/images
+    (cd t_efi  && tar --xattrs --xattrs-include=security.ima -czf ../efi_vol/installer/images/otaefi.tar.gz *)
+    (cd t_rootfs && tar --xattrs --xattrs-include=security.ima --exclude lost+found -czf ../efi_vol/installer/images/otaroot.tar.gz *)
+    (cd t_flux  && tar --xattrs --xattrs-include=security.ima --exclude lost+found -czf ../efi_vol/installer/images/luks_fluxdata.tar.gz *)
+
+    umount t_efi t_rootfs t_flux
     losetup -d ${dev}
-    rmdir t
+    rmdir t_efi t_rootfs t_flux
 fi
 
 #### Step 2 - Patch up initrd and grub config
@@ -69,7 +78,12 @@ if [ $step2 = 1 ] ; then
 	mv efi_vol/up-initrd up-initrd.orig
 	rm -rf in 
 	mkdir in
-	( cd in ; zcat ../up-initrd.orig | cpio -id)
+	zcat up-initrd.orig > up-initrd.uncompressed.orig
+	mkdir -p t 
+	mount -o loop up-initrd.uncompressed.orig t
+	cp -a t/* in
+	umount t
+	rmdir t
 	cp ${config}/install-init in
 	chmod 755 in/install-init
 	( cd initrd-extras ; tar -cf - * | tar -C ../in -xvf - )
@@ -79,9 +93,9 @@ if [ $step2 = 1 ] ; then
 	    # Sign grub cfg
 	    LD_LIBRARY_PATH=${SELSIGN_TOOLS}/../lib ${SELSIGN_TOOLS}/selsign --key ${PRIV_KEY} --cert ${PUB_KEY} ${config}/grub-sfr.cfg
 
-	    if [ -e ${config}/grub-final.cfg ] ; then
+	    if [ -e ${config}/grub-end.cfg ] ; then
 		# Sign finall installed grub cfg if exists
-		LD_LIBRARY_PATH=${SELSIGN_TOOLS}/../lib ${SELSIGN_TOOLS}/selsign --key ${PRIV_KEY} --cert ${PUB_KEY} ${config}/grub-final.cfg
+		LD_LIBRARY_PATH=${SELSIGN_TOOLS}/../lib ${SELSIGN_TOOLS}/selsign --key ${PRIV_KEY} --cert ${PUB_KEY} ${config}/grub-end.cfg
 	    fi
 
 	    # Sign initrd
@@ -93,10 +107,11 @@ if [ $step2 = 1 ] ; then
 	if [ -e ${config}/grub-sfr.cfg.p7b ] ; then
 	    cp ${config}/grub-sfr.cfg.p7b efi_vol/EFI/BOOT/grub.cfg.p7b
 	fi
-	if [ -e ${config}/grub-final.cfg ] ; then
-	    cp ${config}/grub-final.cfg efi_vol/installer/grub-final.cfg
-	    if [ -e ${config}/grub-final.cfg.p7b ] ; then
-		cp ${config}/grub-sfr.cfg.p7b efi_vol/installer/grub-final.cfg.p7b
+	if [ -e ${config}/grub-end.cfg ] ; then
+	    mkdir -p efi_vol/installer
+	    cp ${config}/grub-end.cfg efi_vol/installer/grub-end.cfg
+	    if [ -e ${config}/grub-end.cfg.p7b ] ; then
+		cp ${config}/grub-sfr.cfg.p7b efi_vol/installer/grub-end.cfg.p7b
 	    fi
 	fi
     )

@@ -1,0 +1,59 @@
+#!/bin/bash
+
+dev=$1
+
+if [ ! -e "${dev}" ] ; then
+    echo "Could not find device ${dev}"
+    exit 1
+fi 
+
+# Setup copy location
+#mkdir -p /tmp/cp
+#mount LABEL=otaefi /tmp/cp
+
+# Partition disk
+#parted -s $dev mklabel gpt
+#parted -s $dev mkpart primary fat32 8 2G
+parted -s $dev mkpart primary ext4 2G 6G
+parted -s $dev mkpart primary ext4 6G 100%
+parted -s $dev set 3 boot on
+partprobe $dev
+
+fs_dev=$dev
+if [ "${fs_dev/mmcblk/}" != "$dev" -o "${fs_dev/loop/}" != "$dev" -o "${fs_dev/nbd/}" != "$dev" ] ; then
+    fs_dev="${dev}p"
+fi
+
+# Create and populate file systems
+# EFI
+ln -s /proc/mounts /etc/mtab
+echo "Deploying otaefi"
+# No file system create when it already exists
+#mkfs.msdos -F 32 -n otaefi ${fs_dev}1
+mkdir -p /tmp/mnt
+mount ${fs_dev}1 /tmp/mnt
+a=1
+tar -C /tmp/mnt -xvf images/otaefi.tar.gz | \
+  while read f ; do a=$(($a+1)); if [ $((a%1000)) = 0 ] ; then echo -n . ; fi ; done
+umount /tmp/mnt
+
+# main rootfs
+echo "Deploying otaroot"
+mkfs.ext4 -F -i 8192 -L otaroot ${fs_dev}2
+mount ${fs_dev}2 /tmp/mnt
+a=1
+tar -C /tmp/mnt --xattrs --xattrs-include=security.ima -xvf images/otaroot.tar.gz | \
+  while read f ; do a=$(($a+1)); if [ $((a%1000)) = 0 ] ; then echo -n . ; fi ; done
+umount /tmp/mnt
+
+# ostree volume
+echo "Deploying luks_fluxdata"
+mkfs.ext4 -F -i 8192 -L luks_fluxdata ${fs_dev}3
+mount ${fs_dev}3 /tmp/mnt
+a=1
+tar -C /tmp/mnt --xattrs --xattrs-include=security.ima -xvf images/luks_fluxdata.tar.gz | \
+  while read f ; do a=$(($a+1)); if [ $((a%1000)) = 0 ] ; then echo -n . ; fi ; done
+umount /tmp/mnt
+
+
+
